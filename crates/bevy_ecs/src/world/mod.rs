@@ -1366,6 +1366,63 @@ impl World {
         result
     }
 
+
+    /// Equivalent of [`World::resource_scope`] but for Non-Send Resources.
+    /// ```
+    pub fn non_send_resource_scope<R: 'static, U>(&mut self, f: impl FnOnce(&mut World, Mut<R>) -> U) -> U {
+        let last_change_tick = self.last_change_tick();
+        let change_tick = self.change_tick();
+
+        assert!(self.contains_non_send::<R>(), "non-send resource does not exist: {}", std::any::type_name::<R>());
+
+        let component_id = self
+            .components
+            .get_resource_id(TypeId::of::<R>())
+            .unwrap();
+
+        let (ptr, mut ticks) = self
+            .storages
+            .non_send_resources
+            .get_mut(component_id)
+            .and_then(|info| info.remove())
+            .unwrap_or_else(|| panic!("non-send resource does not exist: {}", std::any::type_name::<R>()));
+        // Read the value onto the stack to avoid potential mut aliasing.
+        // SAFETY: `ptr` was obtained from the TypeId of `R`.
+        let mut value = unsafe { ptr.read::<R>() };
+        let value_mut = Mut {
+            value: &mut value,
+            ticks: TicksMut {
+                added: &mut ticks.added,
+                changed: &mut ticks.changed,
+                last_run: last_change_tick,
+                this_run: change_tick,
+            },
+        };
+        let result = f(self, value_mut);
+        assert!(!self.contains_non_send::<R>(),
+            "Resource `{}` was inserted during a call to World::resource_scope.\n\
+            This is not allowed as the original resource is reinserted to the world after the closure is invoked.",
+            std::any::type_name::<R>());
+
+        OwningPtr::make(value, |ptr| {
+            // SAFETY: pointer is of type R
+            unsafe {
+                self.storages
+                    .non_send_resources
+                    .get_mut(component_id)
+                    .map(|info| info.insert_with_ticks(ptr, ticks))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "No resource of type {} exists in the World.",
+                            std::any::type_name::<R>()
+                        )
+                    });
+            }
+        });
+
+        result
+    }
+
     /// Sends an [`Event`].
     #[inline]
     pub fn send_event<E: Event>(&mut self, event: E) {
